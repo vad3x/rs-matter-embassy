@@ -8,7 +8,8 @@ use embassy_futures::select::select;
 
 use embassy_net::driver::{Driver, HardwareAddress as DriverHardwareAddress};
 use embassy_net::{
-    Config, ConfigV6, HardwareAddress, Ipv6Cidr, Runner, Stack, StackResources, StaticConfigV6,
+    Config, ConfigV6, HardwareAddress, IpAddress, Ipv6Cidr, Runner, Stack, StackResources,
+    StaticConfigV6,
 };
 
 use embassy_time::{Duration, Timer};
@@ -149,7 +150,23 @@ impl NetChangeNotif for EnetNetif<'_> {
     }
 }
 
-/// Create an `embassy-net` stack suitable for the `rs-matter` stack
+/// Create an `embassy-net` stack suitable for the `rs-matter` stack.
+///
+/// In addition to creating the stack with [`create_enet_config`], this also
+/// subscribes the interface to the IPv6 **solicited-node multicast group**
+/// (`ff02::1:ffXX:XXXX`) corresponding to the configured link-local address.
+///
+/// Without this membership, APs that perform MLD snooping (e.g. TP-Link Omada
+/// with Multicast-to-Unicast Conversion enabled) will silently drop the
+/// Neighbor Solicitation packets that commissioners send to resolve the
+/// device's IPv6→MAC mapping, which surfaces as IPv6 unicast traffic
+/// inexplicably failing partway through commissioning.
+///
+/// Calling `join_multicast_group` puts the group in the `Joining` state in
+/// smoltcp; the MLD Membership Report is transmitted on the next interface
+/// poll once the device driver can accept a TX token (i.e. as soon as the
+/// link is up). It is therefore safe to call before the wireless link is
+/// established.
 pub fn create_enet_stack<const N: usize, D: Driver>(
     driver: D,
     seed: u64,
@@ -157,7 +174,14 @@ pub fn create_enet_stack<const N: usize, D: Driver>(
 ) -> (Stack<'_>, Runner<'_, D>) {
     let config = create_enet_config(&driver);
 
-    net::new(driver, config, resources, seed)
+    let (stack, runner) = net::new(driver, config, resources, seed);
+
+    if let Some(v6) = stack.config_v6() {
+        let solicited = solicited_node_multicast_ipv6(&v6.address.address());
+        let _ = stack.join_multicast_group(IpAddress::Ipv6(solicited));
+    }
+
+    (stack, runner)
 }
 
 /// Create a `Config` instance suitable for the `rs-matter` stack:
@@ -205,6 +229,27 @@ pub fn multicast_mac_for_link_local_ipv6(ip: &Ipv6Addr) -> [u8; 6] {
     mac[3..].copy_from_slice(&ip.octets()[13..]);
 
     mac
+}
+
+/// Compute the IPv6 **solicited-node multicast address** (`ff02::1:ffXX:XXXX`)
+/// for a given unicast IPv6 address, per RFC 4291 §2.7.1.
+///
+/// The low-order 24 bits of the unicast address are copied into the low-order
+/// 24 bits of the multicast address. A host MUST be a member of this group for
+/// every unicast address it is assigned so that other nodes can resolve its
+/// MAC via Neighbor Solicitation (RFC 4861 §7.2.1).
+pub fn solicited_node_multicast_ipv6(addr: &Ipv6Addr) -> Ipv6Addr {
+    let o = addr.octets();
+    Ipv6Addr::new(
+        0xff02,
+        0,
+        0,
+        0,
+        0,
+        0x0001,
+        0xff00 | (o[13] as u16),
+        u16::from_be_bytes([o[14], o[15]]),
+    )
 }
 
 /// An implementation of `NetStack` for the `embassy-net` stack
@@ -274,11 +319,36 @@ impl<'a> NetStack for EnetStack<'a> {
 
 #[cfg(test)]
 mod test {
+    use core::net::Ipv6Addr;
+
     #[test]
     fn test() {
         assert_eq!(
             super::create_link_local_ipv6(&[0x52, 0x74, 0xf2, 0xb1, 0xa8, 0x7f]).octets(),
             [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x50, 0x74, 0xf2, 0xff, 0xfe, 0xb1, 0xa8, 0x7f]
         );
+    }
+
+    #[test]
+    fn solicited_node_multicast_ipv6_matches_rfc4291() {
+        // RFC 4291 §2.7.1: copies low 24 bits of the unicast address into ff02::1:ff00:0/104
+        let link_local =
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0x9e13, 0x9eff, 0xfed7, 0xbda8);
+        assert_eq!(
+            super::solicited_node_multicast_ipv6(&link_local),
+            Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0x0001, 0xffd7, 0xbda8),
+        );
+    }
+
+    #[test]
+    fn solicited_node_multicast_mac_matches_low_24_bits() {
+        // Sanity-check that the solicited-node IPv6 and its multicast MAC stay aligned:
+        // both must end in the low 24 bits of the unicast address.
+        let link_local =
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0x9e13, 0x9eff, 0xfed7, 0xbda8);
+        let solicited = super::solicited_node_multicast_ipv6(&link_local);
+        let mac = super::multicast_mac_for_link_local_ipv6(&link_local);
+
+        assert_eq!(&solicited.octets()[13..], &mac[3..]);
     }
 }
