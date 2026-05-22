@@ -3,10 +3,13 @@
 
 use core::cell::Cell;
 use core::net::Ipv6Addr;
+use core::task::Context;
 
 use embassy_futures::select::select;
 
-use embassy_net::driver::{Driver, HardwareAddress as DriverHardwareAddress};
+use embassy_net::driver::{
+    Capabilities, Driver, HardwareAddress as DriverHardwareAddress, LinkState, RxToken, TxToken,
+};
 use embassy_net::{
     Config, ConfigV6, HardwareAddress, IpAddress, Ipv6Cidr, Runner, Stack, StackResources,
     StaticConfigV6,
@@ -152,29 +155,35 @@ impl NetChangeNotif for EnetNetif<'_> {
 
 /// Create an `embassy-net` stack suitable for the `rs-matter` stack.
 ///
-/// In addition to creating the stack with [`create_enet_config`], this also
-/// subscribes the interface to the IPv6 **solicited-node multicast group**
-/// (`ff02::1:ffXX:XXXX`) corresponding to the configured link-local address.
+/// This does two things beyond the bare [`embassy_net::new`]:
 ///
-/// Without this membership, APs that perform MLD snooping (e.g. TP-Link Omada
-/// with Multicast-to-Unicast Conversion enabled) will silently drop the
-/// Neighbor Solicitation packets that commissioners send to resolve the
-/// device's IPv6→MAC mapping, which surfaces as IPv6 unicast traffic
-/// inexplicably failing partway through commissioning.
+/// 1. Subscribes the interface to the IPv6 **solicited-node multicast group**
+///    (`ff02::1:ffXX:XXXX`) derived from the link-local address, so that other
+///    nodes can resolve the device via Neighbor Solicitation.
+/// 2. Wraps the supplied driver in [`Mldv1ConvertingDriver`], which rewrites
+///    every outgoing **MLDv2 Report** (ICMPv6 type 143, sent to `ff02::16`)
+///    into an equivalent **MLDv1 Report** (ICMPv6 type 131, sent to the group
+///    address itself) before handing it to the radio.
 ///
-/// Calling `join_multicast_group` puts the group in the `Joining` state in
-/// smoltcp; the MLD Membership Report is transmitted on the next interface
-/// poll once the device driver can accept a TX token (i.e. as soon as the
-/// link is up). It is therefore safe to call before the wireless link is
-/// established.
+/// **Why MLDv1?** smoltcp emits MLDv2 only. Many consumer/SMB APs — notably
+/// TP-Link Omada with "Multicast-to-Unicast Conversion" enabled — only snoop
+/// MLDv1 and silently drop MLDv2. Without a recognised Membership Report the
+/// AP never learns that this station has joined `ff02::1:ffXX:XXXX`, so it
+/// drops every Neighbor Solicitation aimed at us. IPv6 unicast then appears
+/// to work intermittently (often just long enough for PASE → first CASE)
+/// before silently breaking — typically right after the commissioner's
+/// `AddNOC` for a second fabric, when a fresh ND resolution is required.
+///
+/// The C++ ESP-IDF firmware uses lwIP, which sends MLDv1 by default; this is
+/// why the same hardware works on the same AP under C++ but not under Rust.
 pub fn create_enet_stack<const N: usize, D: Driver>(
     driver: D,
     seed: u64,
     resources: &mut StackResources<N>,
-) -> (Stack<'_>, Runner<'_, D>) {
+) -> (Stack<'_>, Runner<'_, Mldv1ConvertingDriver<D>>) {
     let config = create_enet_config(&driver);
 
-    let (stack, runner) = net::new(driver, config, resources, seed);
+    let (stack, runner) = net::new(Mldv1ConvertingDriver::new(driver), config, resources, seed);
 
     if let Some(v6) = stack.config_v6() {
         let solicited = solicited_node_multicast_ipv6(&v6.address.address());
@@ -250,6 +259,199 @@ pub fn solicited_node_multicast_ipv6(addr: &Ipv6Addr) -> Ipv6Addr {
         0xff00 | (o[13] as u16),
         u16::from_be_bytes([o[14], o[15]]),
     )
+}
+
+// ---------------------------------------------------------------------------
+// MLDv2 → MLDv1 outgoing conversion
+// ---------------------------------------------------------------------------
+
+/// An [`embassy_net::driver::Driver`] wrapper that rewrites outgoing MLDv2
+/// Reports into MLDv1 Reports before they reach the radio.
+///
+/// All non-MLD traffic (and inbound traffic) is passed through unchanged. The
+/// transformation is purely a TX-side fix for AP MLD-snooping compatibility;
+/// see [`create_enet_stack`] for the rationale.
+pub struct Mldv1ConvertingDriver<D> {
+    inner: D,
+}
+
+impl<D> Mldv1ConvertingDriver<D> {
+    pub const fn new(inner: D) -> Self {
+        Self { inner }
+    }
+}
+
+impl<D: Driver> Driver for Mldv1ConvertingDriver<D> {
+    type RxToken<'a>
+        = D::RxToken<'a>
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = Mldv1ConvertingTxToken<D::TxToken<'a>>
+    where
+        Self: 'a;
+
+    fn receive(&mut self, cx: &mut Context) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        self.inner
+            .receive(cx)
+            .map(|(rx, tx)| (rx, Mldv1ConvertingTxToken { inner: tx }))
+    }
+
+    fn transmit(&mut self, cx: &mut Context) -> Option<Self::TxToken<'_>> {
+        self.inner
+            .transmit(cx)
+            .map(|tx| Mldv1ConvertingTxToken { inner: tx })
+    }
+
+    fn link_state(&mut self, cx: &mut Context) -> LinkState {
+        self.inner.link_state(cx)
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn hardware_address(&self) -> DriverHardwareAddress {
+        self.inner.hardware_address()
+    }
+}
+
+/// TX token wrapper that intercepts the outgoing buffer just before the radio
+/// consumes it and applies the MLDv2 → MLDv1 conversion in-place.
+pub struct Mldv1ConvertingTxToken<T> {
+    inner: T,
+}
+
+impl<T: TxToken> TxToken for Mldv1ConvertingTxToken<T> {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        self.inner.consume(len, |buf| {
+            let r = f(buf);
+            convert_mldv2_to_mldv1(buf);
+            r
+        })
+    }
+}
+
+/// In-place rewrite of an outgoing **single-record MLDv2 Report** (RFC 3810)
+/// into an **MLDv1 Report** (RFC 2710) within an Ethernet frame.
+///
+/// smoltcp only ever emits single-record MLDv2 Reports as a side-effect of
+/// `join_multicast_group` / `leave_multicast_group`, plus the periodic state
+/// reporting. We rewrite each one to the older format the AP understands.
+///
+/// Layout transformation:
+///
+/// ```text
+/// MLDv2 Report (Ethernet payload ≥ 36 B):    MLDv1 Report (28 B payload):
+/// [0-5]   dst MAC  33:33:00:00:00:16          [0-5]   dst MAC  33:33:XX:XX:XX:XX (group)
+/// [6-11]  src MAC  (unchanged)                [6-11]  src MAC  (unchanged)
+/// [12-13] 0x86DD                              [12-13] 0x86DD
+/// [14-53] IPv6 hdr (dst=ff02::16, len=36)     [14-53] IPv6 hdr (dst=group, len=32)
+/// [54-61] HbH option header (router-alert)    [54-61] HbH option header (unchanged)
+/// [62]    ICMPv6 type=143                     [62]    ICMPv6 type=131
+/// [63]    code=0                              [63]    code=0
+/// [64-65] checksum                            [64-65] checksum (recomputed)
+/// [66-67] reserved                            [66-67] max response delay=0
+/// [68-69] nr_records=1                        [68-69] reserved=0
+/// [70]    record type                         [70-85] multicast address (16 B)
+/// [71]    aux_len=0
+/// [72-73] num_srcs=0
+/// [74-89] multicast address (16 B)
+/// ```
+///
+/// We deliberately leave the trailing bytes [86..90] as zero padding — the
+/// IPv6 payload length is updated to 32, so the receiver ignores them.
+fn convert_mldv2_to_mldv1(buf: &mut [u8]) {
+    // Eth + IPv6 hdr + HbH + MLDv2 single-record = 90 bytes
+    if buf.len() < 90 {
+        return;
+    }
+    // Ethernet IPv6
+    if buf[12] != 0x86 || buf[13] != 0xDD {
+        return;
+    }
+    // IPv6 Next Header = 0 (Hop-by-Hop) — MLD always uses HbH router alert
+    if buf[20] != 0 {
+        return;
+    }
+    // HbH Next Header = 58 (ICMPv6)
+    if buf[54] != 58 {
+        return;
+    }
+    // ICMPv6 type = 143 (MLDv2 Report)
+    if buf[62] != 143 {
+        return;
+    }
+
+    let mut mcast_addr = [0u8; 16];
+    mcast_addr.copy_from_slice(&buf[74..90]);
+
+    // Destination MAC: 33:33 + low 32 bits of the multicast IPv6 address
+    buf[0] = 0x33;
+    buf[1] = 0x33;
+    buf[2..6].copy_from_slice(&mcast_addr[12..16]);
+
+    // Destination IPv6 = the multicast group itself
+    buf[38..54].copy_from_slice(&mcast_addr);
+
+    // IPv6 payload length = HbH(8) + ICMPv6 MLDv1(24) = 32
+    buf[18] = 0;
+    buf[19] = 32;
+
+    // ICMPv6 header
+    buf[62] = 131; // MLDv1 Membership Report
+    buf[63] = 0; // code
+    buf[64] = 0; // checksum (zeroed for calculation)
+    buf[65] = 0;
+    buf[66] = 0; // max response delay = 0 (reports ignore this field)
+    buf[67] = 0;
+    buf[68] = 0; // reserved
+    buf[69] = 0;
+    buf[70..86].copy_from_slice(&mcast_addr);
+
+    // Zero the trailing 4 bytes of the original MLDv2 record so they don't
+    // leak into anything that might inspect the full frame buffer.
+    buf[86..90].fill(0);
+
+    let cksum = icmpv6_checksum_mldv1(buf);
+    buf[64] = (cksum >> 8) as u8;
+    buf[65] = (cksum & 0xFF) as u8;
+}
+
+/// Compute the ICMPv6 checksum (RFC 4443 §2.3) for a 24-byte MLDv1 message
+/// at offset [62..86] in the given Ethernet frame.
+///
+/// Pseudo-header is src IPv6 (16) + dst IPv6 (16) + upper-layer length (4) +
+/// next header (4 with 3 zero bytes). The caller must have zeroed the
+/// checksum field at [64..66] before calling.
+fn icmpv6_checksum_mldv1(buf: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+
+    let mut i = 22;
+    while i < 38 {
+        sum += u16::from_be_bytes([buf[i], buf[i + 1]]) as u32;
+        i += 2;
+    }
+    i = 38;
+    while i < 54 {
+        sum += u16::from_be_bytes([buf[i], buf[i + 1]]) as u32;
+        i += 2;
+    }
+    sum += 24_u32; // upper-layer length
+    sum += 58_u32; // next header = ICMPv6
+    i = 62;
+    while i < 86 {
+        sum += u16::from_be_bytes([buf[i], buf[i + 1]]) as u32;
+        i += 2;
+    }
+
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 /// An implementation of `NetStack` for the `embassy-net` stack
@@ -350,5 +552,126 @@ mod test {
         let mac = super::multicast_mac_for_link_local_ipv6(&link_local);
 
         assert_eq!(&solicited.octets()[13..], &mac[3..]);
+    }
+
+    /// Build a realistic 90-byte single-record MLDv2 Report frame:
+    /// joining ff02::1:ffd7:bda8 from fe80::9e13:9eff:fed7:bda8.
+    fn make_mldv2_join_frame() -> [u8; 90] {
+        let mut f = [0u8; 90];
+        // Ethernet header
+        f[0..6].copy_from_slice(&[0x33, 0x33, 0x00, 0x00, 0x00, 0x16]); // dst ff02::16
+        f[6..12].copy_from_slice(&[0x9c, 0x13, 0x9e, 0xd7, 0xbd, 0xa8]);
+        f[12] = 0x86;
+        f[13] = 0xDD;
+        // IPv6 header
+        f[14] = 0x60;
+        f[15] = 0;
+        f[16] = 0;
+        f[17] = 0;
+        f[18] = 0;
+        f[19] = 36; // payload len = HbH(8) + MLDv2(28)
+        f[20] = 0; // NH = Hop-by-Hop
+        f[21] = 1; // hop limit (MLD requires 1)
+        f[22..38]
+            .copy_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x9e, 0x13, 0x9e, 0xff, 0xfe, 0xd7, 0xbd, 0xa8]);
+        f[38..54]
+            .copy_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x16]);
+        // Hop-by-Hop options: NH=58 (ICMPv6), len=0 (8 bytes), router-alert
+        f[54] = 58;
+        f[55] = 0;
+        f[56] = 0x05; // router alert option type
+        f[57] = 0x02;
+        f[58] = 0;
+        f[59] = 0;
+        f[60] = 0x01; // PadN
+        f[61] = 0;
+        // ICMPv6 MLDv2 Report
+        f[62] = 143;
+        f[63] = 0;
+        f[64] = 0; // checksum (don't care for the test)
+        f[65] = 0;
+        f[66] = 0; // reserved
+        f[67] = 0;
+        f[68] = 0; // nr_records hi
+        f[69] = 1; // nr_records lo
+        f[70] = 4; // record type: CHANGE_TO_EXCLUDE_MODE (treat as include for join)
+        f[71] = 0; // aux data len
+        f[72] = 0; // num srcs hi
+        f[73] = 0;
+        f[74..90]
+            .copy_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, 0xd7, 0xbd, 0xa8]);
+        f
+    }
+
+    #[test]
+    fn mldv2_to_mldv1_converts_dest_mac_and_ip_to_group() {
+        let mut frame = make_mldv2_join_frame();
+
+        super::convert_mldv2_to_mldv1(&mut frame);
+
+        // Destination MAC must become 33:33 + low 32 bits of the group address
+        assert_eq!(frame[0..6], [0x33, 0x33, 0xff, 0xd7, 0xbd, 0xa8]);
+        // Destination IPv6 must become the group itself
+        assert_eq!(
+            frame[38..54],
+            [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, 0xd7, 0xbd, 0xa8]
+        );
+        // ICMPv6 type must be 131 (MLDv1 Membership Report)
+        assert_eq!(frame[62], 131);
+        // IPv6 payload length must be 32 (HbH 8 + MLDv1 24)
+        assert_eq!(u16::from_be_bytes([frame[18], frame[19]]), 32);
+        // Multicast address field in MLDv1 payload must match the group
+        assert_eq!(
+            frame[70..86],
+            [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, 0xd7, 0xbd, 0xa8]
+        );
+    }
+
+    #[test]
+    fn mldv2_to_mldv1_writes_valid_icmpv6_checksum() {
+        let mut frame = make_mldv2_join_frame();
+
+        super::convert_mldv2_to_mldv1(&mut frame);
+
+        // A correctly-checksummed ICMPv6 message verifies as 0 when summed with
+        // its own checksum still in place.
+        let mut verify = frame;
+        // Recompute over the post-conversion frame with the checksum field in place.
+        let computed_when_zeroed = {
+            verify[64] = 0;
+            verify[65] = 0;
+            super::icmpv6_checksum_mldv1(&verify)
+        };
+        let written = u16::from_be_bytes([frame[64], frame[65]]);
+        assert_eq!(written, computed_when_zeroed);
+        // And the written checksum must be non-trivial (sanity).
+        assert_ne!(written, 0);
+    }
+
+    #[test]
+    fn convert_mldv2_to_mldv1_is_noop_for_non_mld_frame() {
+        // A regular UDP-over-IPv6 frame should be left untouched.
+        let mut frame = [0u8; 90];
+        frame[12] = 0x86;
+        frame[13] = 0xDD;
+        frame[20] = 17; // NH = UDP, NOT Hop-by-Hop
+        let before = frame;
+
+        super::convert_mldv2_to_mldv1(&mut frame);
+
+        assert_eq!(frame, before);
+    }
+
+    #[test]
+    fn convert_mldv2_to_mldv1_is_noop_for_non_ipv6_frame() {
+        // ARP / IPv4 / random ethertype must be left untouched.
+        let mut frame = [0u8; 90];
+        frame[12] = 0x08;
+        frame[13] = 0x00; // IPv4
+        let before = frame;
+
+        super::convert_mldv2_to_mldv1(&mut frame);
+
+        assert_eq!(frame, before);
     }
 }
