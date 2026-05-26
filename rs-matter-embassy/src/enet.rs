@@ -496,6 +496,12 @@ fn icmpv6_checksum_mldv1(buf: &[u8]) -> u16 {
 /// 8 (option) = 86 bytes.
 const NDP_FRAME_LEN: usize = 86;
 
+/// Number of distinct peers we remember as "already taught" so we don't
+/// re-inject a Neighbor Solicitation on every incoming frame from the same
+/// peer. Four is plenty for Matter: the iPhone, the Home Hub, and a couple
+/// of extra commissioners.
+const LEARNED_SLOTS: usize = 4;
+
 /// An [`embassy_net::driver::Driver`] wrapper that populates smoltcp's
 /// neighbor cache from incoming unicast IPv6 data frames.
 ///
@@ -515,23 +521,28 @@ const NDP_FRAME_LEN: usize = 86;
 ///    [`Mldv1ConvertingDriver`] for that part of the story).
 /// 5. Reply never goes out; commissioning eventually times out.
 ///
-/// This wrapper sidesteps the problem entirely: whenever a unicast IPv6
-/// frame arrives, we record its `{src_mac, src_ipv6}`; on the very next
-/// `Driver::receive` call we sacrifice one real RX frame and replace it
-/// with a synthetic Neighbor Solicitation that appears to come from the
-/// peer asking "who has our address?". smoltcp processes the NS, caches
-/// the binding from the SLLA option, and replies with a Neighbor
-/// Advertisement. From that point on, outbound packets to the peer go out
-/// immediately with no resolution round trip.
+/// This wrapper sidesteps the problem: the first unicast IPv6 frame from
+/// each new peer queues `{src_mac, src_ipv6}` for learning, then on the
+/// **next idle `Driver::receive` poll** (when the radio has no real RX
+/// frame waiting) we hand smoltcp a synthetic Neighbor Solicitation that
+/// appears to come from the peer asking "who has our address?". smoltcp
+/// records the binding from the SLLA option and replies with a Neighbor
+/// Advertisement. The TxToken needed for the NA reply is obtained from
+/// `inner.transmit()` — we never sacrifice a real RX frame.
 ///
-/// The single dropped frame is harmless in practice — Matter MRP retries
-/// it within ~200 ms, and on the retry the neighbor cache is populated so
-/// the reply goes out immediately.
+/// A small LRU of already-taught peers (`LEARNED_SLOTS` entries) ensures
+/// we inject at most once per peer, so a chatty session doesn't generate a
+/// synthetic NS for every incoming packet.
 pub struct NeighborLearningDriver<D> {
     inner: D,
     our_mac: [u8; 6],
     our_ipv6: [u8; 16],
+    /// Single-slot queue of the next peer that needs a synthetic NS.
     pending: Cell<Option<([u8; 6], [u8; 16])>>,
+    /// IPv6 addresses of peers we have already taught smoltcp about.
+    /// Round-robin overwrite at `learned_next`.
+    learned: Cell<[Option<[u8; 16]>; LEARNED_SLOTS]>,
+    learned_next: Cell<usize>,
 }
 
 impl<D: Driver> NeighborLearningDriver<D> {
@@ -550,6 +561,8 @@ impl<D: Driver> NeighborLearningDriver<D> {
             our_mac,
             our_ipv6,
             pending: Cell::new(None),
+            learned: Cell::new([None; LEARNED_SLOTS]),
+            learned_next: Cell::new(0),
         }
     }
 }
@@ -565,49 +578,63 @@ impl<D: Driver> Driver for NeighborLearningDriver<D> {
         Self: 'a;
 
     fn receive(&mut self, cx: &mut Context) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // If a peer was queued on a previous RX, sacrifice one real RX slot
-        // and feed smoltcp a synthetic NS so the {peer_ipv6 → peer_mac}
-        // binding lands in the neighbor cache before any outbound packet
-        // needs it.
-        if let Some((remote_mac, remote_ipv6)) = self.pending.replace(None) {
-            match self.inner.receive(cx) {
-                Some((rx, tx)) => {
-                    rx.consume(|_| {}); // drop the real frame, peer will retry
-                    let mut frame = [0u8; NDP_FRAME_LEN];
-                    construct_synthetic_ns(
-                        &mut frame,
-                        &self.our_mac,
-                        &self.our_ipv6,
-                        &remote_mac,
-                        &remote_ipv6,
-                    );
-                    log::info!(
-                        "NeighborLearn: inject synthetic NS for {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                        remote_mac[0], remote_mac[1], remote_mac[2],
-                        remote_mac[3], remote_mac[4], remote_mac[5],
-                    );
-                    return Some((
-                        NeighborLearningRxToken {
-                            inner: NeighborLearningRxTokenInner::Synthetic(frame),
-                            pending: &self.pending,
-                        },
-                        tx,
-                    ));
-                }
-                None => {
-                    // No RX slot available right now — keep the entry pending
-                    // for the next poll.
-                    self.pending.set(Some((remote_mac, remote_ipv6)));
-                    return None;
-                }
+        // Phase 1: opportunistic synthetic NS injection. Triggered at most
+        // once per peer (gated by the `learned` LRU) and only when a peer
+        // is queued AND the inner driver has a TxToken to spare for the NA
+        // reply smoltcp will generate.
+        //
+        // We do this BEFORE the real-RX path so the synthetic NS reaches
+        // smoltcp before any outbound traffic to the new peer is generated.
+        // At most one poll cycle of real RX is "delayed" per new peer,
+        // bounded by `LEARNED_SLOTS` over the lifetime of the stack.
+        //
+        // SAFETY: the borrow-checker workaround below uses a raw pointer to
+        // re-borrow `self.inner` in the fallback phase. This is sound
+        // because the two phases are mutually exclusive at runtime:
+        //   - Phase 1 either returns (Some) or releases its borrow (None).
+        //   - Phase 2 only runs after Phase 1 has released its borrow.
+        // No tokens or references from one phase escape into the other.
+        // The pointer is never aliased: each phase's borrow is the unique
+        // mutable access to `self.inner` for its execution path.
+        if self.pending.get().is_some() {
+            let inner: *mut D = &mut self.inner;
+            // SAFETY: see above.
+            if let Some(tx) = unsafe { (*inner).transmit(cx) } {
+                let (remote_mac, remote_ipv6) = self.pending.replace(None).unwrap();
+                record_learned(&self.learned, &self.learned_next, remote_ipv6);
+                let mut frame = [0u8; NDP_FRAME_LEN];
+                construct_synthetic_ns(
+                    &mut frame,
+                    &self.our_mac,
+                    &self.our_ipv6,
+                    &remote_mac,
+                    &remote_ipv6,
+                );
+                log::info!(
+                    "NeighborLearn: teach smoltcp about {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (synthetic NS)",
+                    remote_mac[0], remote_mac[1], remote_mac[2],
+                    remote_mac[3], remote_mac[4], remote_mac[5],
+                );
+                return Some((
+                    NeighborLearningRxToken {
+                        inner: NeighborLearningRxTokenInner::Synthetic(frame),
+                        pending: &self.pending,
+                        learned: &self.learned,
+                    },
+                    tx,
+                ));
             }
         }
 
+        // Phase 2: deliver real RX untouched. We never sacrifice real frames
+        // — dropping a Matter packet triggers MRP retransmissions and
+        // ultimately exchange timeouts.
         let (rx, tx) = self.inner.receive(cx)?;
         Some((
             NeighborLearningRxToken {
                 inner: NeighborLearningRxTokenInner::Real(rx),
                 pending: &self.pending,
+                learned: &self.learned,
             },
             tx,
         ))
@@ -637,6 +664,7 @@ impl<D: Driver> Driver for NeighborLearningDriver<D> {
 pub struct NeighborLearningRxToken<'a, T> {
     inner: NeighborLearningRxTokenInner<T>,
     pending: &'a Cell<Option<([u8; 6], [u8; 16])>>,
+    learned: &'a Cell<[Option<[u8; 16]>; LEARNED_SLOTS]>,
 }
 
 enum NeighborLearningRxTokenInner<T> {
@@ -652,8 +680,9 @@ impl<T: RxToken> RxToken for NeighborLearningRxToken<'_, T> {
         match self.inner {
             NeighborLearningRxTokenInner::Real(inner) => {
                 let pending = self.pending;
+                let learned = self.learned;
                 inner.consume(|buf| {
-                    queue_neighbor_from_frame(buf, pending);
+                    queue_neighbor_from_frame(buf, pending, learned);
                     f(buf)
                 })
             }
@@ -662,26 +691,31 @@ impl<T: RxToken> RxToken for NeighborLearningRxToken<'_, T> {
     }
 }
 
-/// If `buf` is an inbound unicast IPv6 Ethernet frame from a real source,
-/// stash its `{src_mac, src_ipv6}` in `pending` so the driver's next
-/// `receive` call can inject a synthetic Neighbor Solicitation for it.
+/// If `buf` is an inbound unicast IPv6 Ethernet frame from a real source we
+/// haven't already taught smoltcp about, stash its `{src_mac, src_ipv6}` in
+/// `pending` so the driver's next idle `receive` poll can inject a
+/// synthetic Neighbor Solicitation for it.
 ///
 /// Skipped if:
 /// - the frame is not IPv6 (EtherType ≠ 0x86DD),
 /// - the destination MAC is multicast/broadcast (we only learn from frames
 ///   addressed to us),
 /// - the source IPv6 is the unspecified address `::` (e.g. during DAD),
-/// - a previous entry is still pending (we don't overwrite — the first
-///   learning chance per cycle is good enough).
-fn queue_neighbor_from_frame(buf: &[u8], pending: &Cell<Option<([u8; 6], [u8; 16])>>) {
+/// - the source IPv6 is already recorded in `learned` (we've already
+///   taught smoltcp about this peer in this session),
+/// - a previous entry is still pending (we never overwrite — first peer in
+///   wins until it has been injected).
+fn queue_neighbor_from_frame(
+    buf: &[u8],
+    pending: &Cell<Option<([u8; 6], [u8; 16])>>,
+    learned: &Cell<[Option<[u8; 16]>; LEARNED_SLOTS]>,
+) {
     if buf.len() < 54 || buf[12] != 0x86 || buf[13] != 0xDD {
         return;
     }
-    // Multicast bit set on destination MAC → not addressed to us alone.
     if buf[0] & 0x01 != 0 {
         return;
     }
-    // Unspecified source IPv6 — nothing useful to learn.
     if buf[22..38] == [0u8; 16] {
         return;
     }
@@ -689,12 +723,41 @@ fn queue_neighbor_from_frame(buf: &[u8], pending: &Cell<Option<([u8; 6], [u8; 16
         return;
     }
 
-    let mut src_mac = [0u8; 6];
-    src_mac.copy_from_slice(&buf[6..12]);
     let mut src_ipv6 = [0u8; 16];
     src_ipv6.copy_from_slice(&buf[22..38]);
 
+    if is_learned(learned, &src_ipv6) {
+        return;
+    }
+
+    let mut src_mac = [0u8; 6];
+    src_mac.copy_from_slice(&buf[6..12]);
+
     pending.set(Some((src_mac, src_ipv6)));
+}
+
+/// Check whether the given peer IPv6 is recorded in the learned-peers LRU.
+fn is_learned(
+    learned: &Cell<[Option<[u8; 16]>; LEARNED_SLOTS]>,
+    ipv6: &[u8; 16],
+) -> bool {
+    learned
+        .get()
+        .iter()
+        .any(|slot| slot.as_ref() == Some(ipv6))
+}
+
+/// Insert `ipv6` into the learned-peers LRU, evicting the round-robin slot.
+fn record_learned(
+    learned: &Cell<[Option<[u8; 16]>; LEARNED_SLOTS]>,
+    next: &Cell<usize>,
+    ipv6: [u8; 16],
+) {
+    let mut arr = learned.get();
+    let idx = next.get();
+    arr[idx] = Some(ipv6);
+    learned.set(arr);
+    next.set((idx + 1) % LEARNED_SLOTS);
 }
 
 /// Build a Neighbor Solicitation Ethernet frame that appears to come from
@@ -1045,9 +1108,15 @@ mod test {
         f
     }
 
+    fn empty_learned() -> Cell<[Option<[u8; 16]>; super::LEARNED_SLOTS]> {
+        Cell::new([None; super::LEARNED_SLOTS])
+    }
+
     #[test]
     fn queue_neighbor_records_src_from_unicast_ipv6_frame() {
+        // Arrange
         let pending: Cell<Option<([u8; 6], [u8; 16])>> = Cell::new(None);
+        let learned = empty_learned();
         let src_mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
         let src_ipv6 = [
             0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
@@ -1058,15 +1127,18 @@ mod test {
         ];
         let frame = make_unicast_ipv6_frame(our_mac, src_mac, src_ipv6, our_ipv6);
 
-        super::queue_neighbor_from_frame(&frame, &pending);
+        // Act
+        super::queue_neighbor_from_frame(&frame, &pending, &learned);
 
+        // Assert
         assert_eq!(pending.get(), Some((src_mac, src_ipv6)));
     }
 
     #[test]
     fn queue_neighbor_ignores_multicast_destination() {
+        // Arrange
         let pending: Cell<Option<([u8; 6], [u8; 16])>> = Cell::new(None);
-        // Multicast MAC (low bit of first byte set)
+        let learned = empty_learned();
         let dst_mac = [0x33, 0x33, 0x00, 0x00, 0x00, 0x01];
         let src_mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
         let src_ipv6 = [
@@ -1074,29 +1146,36 @@ mod test {
         ];
         let frame = make_unicast_ipv6_frame(dst_mac, src_mac, src_ipv6, [0xff; 16]);
 
-        super::queue_neighbor_from_frame(&frame, &pending);
+        // Act
+        super::queue_neighbor_from_frame(&frame, &pending, &learned);
 
+        // Assert
         assert_eq!(pending.get(), None);
     }
 
     #[test]
     fn queue_neighbor_ignores_unspecified_source() {
+        // Arrange
         let pending: Cell<Option<([u8; 6], [u8; 16])>> = Cell::new(None);
+        let learned = empty_learned();
         let our_mac = [0x9c, 0x13, 0x9e, 0xd7, 0xbd, 0xa8];
         let frame = make_unicast_ipv6_frame(
             our_mac,
             [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
-            [0; 16], // src = ::
+            [0; 16],
             [0xff; 16],
         );
 
-        super::queue_neighbor_from_frame(&frame, &pending);
+        // Act
+        super::queue_neighbor_from_frame(&frame, &pending, &learned);
 
+        // Assert
         assert_eq!(pending.get(), None);
     }
 
     #[test]
     fn queue_neighbor_does_not_overwrite_existing_entry() {
+        // Arrange
         let existing = (
             [1u8, 2, 3, 4, 5, 6],
             [
@@ -1104,6 +1183,7 @@ mod test {
             ],
         );
         let pending: Cell<Option<([u8; 6], [u8; 16])>> = Cell::new(Some(existing));
+        let learned = empty_learned();
         let our_mac = [0x9c, 0x13, 0x9e, 0xd7, 0xbd, 0xa8];
         let frame = make_unicast_ipv6_frame(
             our_mac,
@@ -1114,21 +1194,84 @@ mod test {
             [0xff; 16],
         );
 
-        super::queue_neighbor_from_frame(&frame, &pending);
+        // Act
+        super::queue_neighbor_from_frame(&frame, &pending, &learned);
 
+        // Assert
         assert_eq!(pending.get(), Some(existing));
     }
 
     #[test]
     fn queue_neighbor_ignores_non_ipv6_frame() {
+        // Arrange
         let pending: Cell<Option<([u8; 6], [u8; 16])>> = Cell::new(None);
+        let learned = empty_learned();
         let mut frame = [0u8; 60];
-        frame[12] = 0x08; // IPv4 EtherType
+        frame[12] = 0x08;
         frame[13] = 0x00;
 
-        super::queue_neighbor_from_frame(&frame, &pending);
+        // Act
+        super::queue_neighbor_from_frame(&frame, &pending, &learned);
 
+        // Assert
         assert_eq!(pending.get(), None);
+    }
+
+    #[test]
+    fn queue_neighbor_skips_already_learned_peer() {
+        // Arrange
+        let pending: Cell<Option<([u8; 6], [u8; 16])>> = Cell::new(None);
+        let learned = empty_learned();
+        let next: Cell<usize> = Cell::new(0);
+        let our_mac = [0x9c, 0x13, 0x9e, 0xd7, 0xbd, 0xa8];
+        let our_ipv6 = [
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x9e, 0x13, 0x9e, 0xff, 0xfe, 0xd7, 0xbd, 0xa8,
+        ];
+        let src_mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let src_ipv6 = [
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+        ];
+        let frame = make_unicast_ipv6_frame(our_mac, src_mac, src_ipv6, our_ipv6);
+        super::record_learned(&learned, &next, src_ipv6);
+
+        // Act
+        super::queue_neighbor_from_frame(&frame, &pending, &learned);
+
+        // Assert
+        assert_eq!(pending.get(), None);
+    }
+
+    #[test]
+    fn record_learned_round_robins_over_slots() {
+        // Arrange
+        let learned = empty_learned();
+        let next: Cell<usize> = Cell::new(0);
+        let mut peers: [[u8; 16]; super::LEARNED_SLOTS] = [[0; 16]; super::LEARNED_SLOTS];
+        for (i, peer) in peers.iter_mut().enumerate() {
+            peer[15] = (i as u8) + 1;
+        }
+        let extra = {
+            let mut a = [0u8; 16];
+            a[15] = 99;
+            a
+        };
+
+        // Act
+        for peer in &peers {
+            super::record_learned(&learned, &next, *peer);
+        }
+        for peer in &peers {
+            assert!(super::is_learned(&learned, peer));
+        }
+        super::record_learned(&learned, &next, extra);
+
+        // Assert: the oldest slot was evicted, the rest plus the new one remain.
+        assert!(!super::is_learned(&learned, &peers[0]));
+        for peer in &peers[1..] {
+            assert!(super::is_learned(&learned, peer));
+        }
+        assert!(super::is_learned(&learned, &extra));
+        assert_eq!(next.get(), 1);
     }
 
     #[test]
