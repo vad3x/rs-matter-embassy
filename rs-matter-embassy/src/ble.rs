@@ -52,12 +52,25 @@ struct Server {
     matter_service: MatterService,
 }
 
-/// Matter service
+/// Matter service.
+///
+/// Per the Matter spec and every reference implementation in
+/// `connectedhomeip/src/platform/*/BLEManagerImpl.cpp`:
+///
+/// - C1 (RX, central -> peripheral): `Write` and `WriteWithoutResponse`.
+/// - C2 (TX, peripheral -> central): `Indicate` only.
+///
+/// Note for macOS / iOS controllers: Apple blocks standard apps from writing
+/// the Matter characteristic UUIDs by default and returns
+/// `CBErrorUUIDNotAllowed (code 8)` locally without anything reaching the air.
+/// To use `chip-tool` over BLE on macOS/iOS, install Apple's
+/// "Bluetooth Central Matter Client Developer Mode" profile and reboot;
+/// production apps must commission via the `MatterSupport` framework.
 #[gatt_service(uuid = MATTER_BLE_SERVICE_UUID16)]
 struct MatterService {
-    #[characteristic(uuid = C1_CHARACTERISTIC_UUID, write)]
+    #[characteristic(uuid = C1_CHARACTERISTIC_UUID, write, write_without_response)]
     c1: External,
-    #[characteristic(uuid = C2_CHARACTERISTIC_UUID, write, indicate)]
+    #[characteristic(uuid = C2_CHARACTERISTIC_UUID, indicate)]
     c2: External,
 }
 
@@ -332,7 +345,7 @@ where
                         data: bytes,
                     }) => {
                         if handle == server.matter_service.c1.handle {
-                            trace!(
+                            info!(
                                 "GATT: C1 Write {} len {} / MTU {}",
                                 Bytes(bytes),
                                 bytes.len(),
@@ -350,7 +363,7 @@ where
                         } else if Some(handle) == server.matter_service.c2.cccd_handle {
                             let subscription_req = bytes[0] != 0;
 
-                            trace!("GATT: Write to C2 CCC descriptor: {:?}", bytes);
+                            info!("GATT: Write to C2 CCC descriptor: {:?}", bytes);
 
                             Self::write_reply(event).await?;
 
@@ -365,14 +378,34 @@ where
                                 break;
                             }
                         } else {
+                            info!(
+                                "GATT: Write to unknown handle {} (C1={} C2={} C2.cccd={:?}) bytes={:?}",
+                                handle,
+                                server.matter_service.c1.handle,
+                                server.matter_service.c2.handle,
+                                server.matter_service.c2.cccd_handle,
+                                bytes
+                            );
                             Self::accept(event).await?;
                         }
                     }
+                    AttClient::Request(AttReq::Read { handle }) => {
+                        info!(
+                            "GATT: Read from handle {} (C1={} C2={})",
+                            handle,
+                            server.matter_service.c1.handle,
+                            server.matter_service.c2.handle
+                        );
+                        Self::accept(event).await?;
+                    }
                     AttClient::Confirmation(AttCfm::ConfirmIndication) => {
-                        trace!("GATT: Confirm indication");
+                        info!("GATT: Confirm indication");
                         ind_ack.notify();
                     }
-                    _ => Self::accept(event).await?,
+                    other => {
+                        info!("GATT: Other AttClient event: {:?}", other);
+                        Self::accept(event).await?;
+                    }
                 },
                 _ => (),
             }
