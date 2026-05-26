@@ -155,38 +155,60 @@ impl NetChangeNotif for EnetNetif<'_> {
 
 /// The driver chain returned by [`create_enet_stack`].
 ///
-/// The supplied driver `D` is wrapped twice:
+/// Depending on which Cargo features are enabled, the supplied driver `D`
+/// is wrapped with zero, one, or both compatibility shims:
 ///
-/// 1. Innermost: [`Mldv1ConvertingDriver`] — rewrites every outgoing MLDv2
-///    Report into an equivalent MLDv1 Report on the TX path.
-/// 2. Outermost: [`NeighborLearningDriver`] — populates smoltcp's IPv6
-///    neighbor cache from incoming unicast IPv6 frames via synthetic
-///    Neighbor Solicitation injection on the RX path.
+/// | `mld-v1-compat` | `nd-learn-from-frames` | resulting chain                                       |
+/// |-----------------|------------------------|-------------------------------------------------------|
+/// | on              | on                     | `NeighborLearningDriver<Mldv1ConvertingDriver<D>>`    |
+/// | on              | off                    | `Mldv1ConvertingDriver<D>`                            |
+/// | off             | on                     | `NeighborLearningDriver<D>`                           |
+/// | off             | off                    | `D` (no wrapping)                                     |
 ///
-/// The wrappers are transparent on the path they do not touch, so the chain
-/// is functionally equivalent to `D` for all non-MLD / non-IPv6 traffic.
+/// Both features are on by default. Each wrapper is transparent on the path
+/// it does not touch, so the chain is functionally equivalent to `D` for all
+/// non-MLD / non-IPv6 traffic.
+#[cfg(all(feature = "mld-v1-compat", feature = "nd-learn-from-frames"))]
 pub type MatterEnetDriver<D> = NeighborLearningDriver<Mldv1ConvertingDriver<D>>;
+
+/// See [`MatterEnetDriver`] above for the feature → chain mapping.
+#[cfg(all(feature = "mld-v1-compat", not(feature = "nd-learn-from-frames")))]
+pub type MatterEnetDriver<D> = Mldv1ConvertingDriver<D>;
+
+/// See [`MatterEnetDriver`] above for the feature → chain mapping.
+#[cfg(all(not(feature = "mld-v1-compat"), feature = "nd-learn-from-frames"))]
+pub type MatterEnetDriver<D> = NeighborLearningDriver<D>;
+
+/// See [`MatterEnetDriver`] above for the feature → chain mapping.
+#[cfg(all(not(feature = "mld-v1-compat"), not(feature = "nd-learn-from-frames")))]
+pub type MatterEnetDriver<D> = D;
 
 /// Create an `embassy-net` stack suitable for the `rs-matter` stack.
 ///
-/// This does three things beyond the bare [`embassy_net::new`]:
+/// Beyond the bare [`embassy_net::new`], this function:
 ///
 /// 1. Subscribes the interface to the IPv6 **solicited-node multicast group**
 ///    (`ff02::1:ffXX:XXXX`) derived from the link-local address, so that other
 ///    nodes can resolve the device via Neighbor Solicitation.
-/// 2. Wraps the supplied driver in [`Mldv1ConvertingDriver`], which rewrites
+/// 2. Optionally wraps the supplied driver in [`Mldv1ConvertingDriver`]
+///    (when the `mld-v1-compat` feature is enabled — default), which rewrites
 ///    every outgoing **MLDv2 Report** (ICMPv6 type 143, sent to `ff02::16`)
 ///    into an equivalent **MLDv1 Report** (ICMPv6 type 131, sent to the group
 ///    address itself) before handing it to the radio.
-/// 3. Wraps the result again in [`NeighborLearningDriver`], which teaches
+/// 3. Optionally wraps the result in [`NeighborLearningDriver`] (when the
+///    `nd-learn-from-frames` feature is enabled — default), which teaches
 ///    smoltcp's neighbor cache about peers from incoming unicast IPv6 data
 ///    frames by injecting synthetic Neighbor Solicitations on the RX path.
+///
+/// The exact composition of the returned driver type is captured by the
+/// [`MatterEnetDriver`] type alias and varies with the feature set.
 ///
 /// **Why MLDv1?** smoltcp emits MLDv2 only. Many consumer/SMB APs — notably
 /// TP-Link Omada with "Multicast-to-Unicast Conversion" enabled — only snoop
 /// MLDv1 and silently drop MLDv2. Without a recognised Membership Report the
 /// AP never learns that this station has joined `ff02::1:ffXX:XXXX`, so it
-/// drops every Neighbor Solicitation aimed at us.
+/// drops every Neighbor Solicitation aimed at us. Disable the `mld-v1-compat`
+/// feature only if your AP is known to handle MLDv2 correctly.
 ///
 /// **Why synthetic NS injection?** smoltcp learns IPv6 neighbor cache entries
 /// only from NDP messages (NS/NA/RA), never from plain data frames — unlike
@@ -195,7 +217,9 @@ pub type MatterEnetDriver<D> = NeighborLearningDriver<Mldv1ConvertingDriver<D>>;
 /// waiting for a Neighbor Solicitation round trip that may never succeed. By
 /// faking an inbound NS "from" each peer whose data frame we just received,
 /// we install the `{peer_ipv6 → peer_mac}` mapping immediately and skip
-/// resolution entirely on the reply path.
+/// resolution entirely on the reply path. Disable the `nd-learn-from-frames`
+/// feature only if your AP is known to deliver multicast Neighbor
+/// Solicitations to associated stations reliably.
 ///
 /// The C++ ESP-IDF firmware uses lwIP, which sends MLDv1 by default and
 /// learns neighbors from any frame; this is why the same hardware works on
@@ -207,8 +231,12 @@ pub fn create_enet_stack<const N: usize, D: Driver>(
 ) -> (Stack<'_>, Runner<'_, MatterEnetDriver<D>>) {
     let config = create_enet_config(&driver);
 
-    let wrapped = NeighborLearningDriver::new(Mldv1ConvertingDriver::new(driver));
-    let (stack, runner) = net::new(wrapped, config, resources, seed);
+    #[cfg(feature = "mld-v1-compat")]
+    let driver = Mldv1ConvertingDriver::new(driver);
+    #[cfg(feature = "nd-learn-from-frames")]
+    let driver = NeighborLearningDriver::new(driver);
+
+    let (stack, runner) = net::new(driver, config, resources, seed);
 
     if let Some(v6) = stack.config_v6() {
         let solicited = solicited_node_multicast_ipv6(&v6.address.address());

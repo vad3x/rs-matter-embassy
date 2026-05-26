@@ -16,7 +16,28 @@ rust-version = "1.84"
 harness = false
 
 [features]
-default = ["rustcrypto"]
+default = ["rustcrypto", "mld-v1-compat", "nd-learn-from-frames"]
+
+# Networking workarounds (only effective when the `embassy-net` feature is on).
+#
+# Both default to ON because they fix consumer-AP / smoltcp interactions that
+# otherwise break Matter commissioning (notably with TP-Link Omada APs that
+# only snoop MLDv1, and with smoltcp's NDP-only neighbor-cache learning).
+# Disable them only if you know your AP + stack don't need them — for instance
+# if you are on a managed network with a modern IPv6 router and want to keep
+# `embassy-net` IPv6 traffic strictly RFC-conformant. See `enet.rs` for the
+# full rationale.
+
+# Rewrites every outgoing MLDv2 Membership Report into an equivalent MLDv1
+# Membership Report on the TX path, so APs that only snoop MLDv1 learn that
+# the device has joined the IPv6 solicited-node multicast group it needs.
+mld-v1-compat = []
+
+# Populates smoltcp's IPv6 neighbor cache from incoming unicast IPv6 data
+# frames by injecting synthetic Neighbor Solicitations on idle RX polls.
+# Without this, smoltcp may stall outbound replies for tens of seconds while
+# it tries (and often fails) to resolve a peer that just talked to us.
+nd-learn-from-frames = []
 
 # Sizing
 
