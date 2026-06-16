@@ -35,14 +35,21 @@ pub mod net {
 }
 
 /// The minimum number of sockets that should be configured in the `embassy-net` `StackResources`:
-/// The two UDP sockets used by the Matter stack, plus extra 2 for DHCP + DNS
+/// The two UDP sockets used by the Matter stack, plus the spare app-level UDP
+/// socket(s), plus extra 2 for DHCP + DNS
 // TODO: Make it configurable with a feature
-pub const ENET_MIN_SOCKET_SET: usize = ENET_MAX_UDP_SOCKETS + 2;
+pub const ENET_MIN_SOCKET_SET: usize = ENET_MAX_UDP_SOCKETS + ENET_EXTRA_UDP_SOCKETS + 2;
+
+/// Spare UDP sockets left free in the pool for application-level use through the
+/// `NetStack` handle (e.g. remote log shipping over UDP). The Matter stack only
+/// ever binds `ENET_MAX_UDP_SOCKETS`; without this headroom a `udp_bind().bind()`
+/// from a `UserTask` would fail because the pool is exactly sized for Matter.
+pub const ENET_EXTRA_UDP_SOCKETS: usize = 1;
 
 /// A type alias for the `UdpBuffers` type configured with the minimum number of UDP socket buffers
 /// sufficient for the operation of the Matter stack
 pub type EnetMatterUdpBuffers = UdpBuffers<
-    ENET_MAX_UDP_SOCKETS,
+    { ENET_MAX_UDP_SOCKETS + ENET_EXTRA_UDP_SOCKETS },
     MAX_TX_PACKET_SIZE,
     MAX_RX_PACKET_SIZE,
     ENET_MAX_UDP_META_DATA,
@@ -57,8 +64,9 @@ pub type EnetMatterStackResources = StackResources<ENET_MIN_SOCKET_SET>;
 /// - Another, for the UDP socket used by the mDNS responder
 // TODO: Make it configurable with a feature
 const ENET_MAX_UDP_SOCKETS: usize = 2;
-/// The max number of meta data buffers that the Matter stack would use
-const ENET_MAX_UDP_META_DATA: usize = 4;
+/// The max number of meta data buffers that the Matter stack would use.
+/// Sized for the Matter sockets plus the spare app-level UDP socket(s).
+const ENET_MAX_UDP_META_DATA: usize = 6;
 
 /// The MAC address used for mDNS multicast queries over IPv4
 ///
