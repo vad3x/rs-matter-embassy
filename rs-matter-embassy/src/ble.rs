@@ -345,7 +345,7 @@ where
                         data: bytes,
                     }) => {
                         if handle == server.matter_service.c1.handle {
-                            info!(
+                            trace!(
                                 "GATT: C1 Write {} len {} / MTU {}",
                                 Bytes(bytes),
                                 bytes.len(),
